@@ -1,6 +1,6 @@
-# <NAME> - Speech Processing Pipeline
+# (NAME) - Speech Processing Pipeline
 
-<NAME> is a speech processing pipeline for the diarization and transcription of large audio files.
+(NAME) is a speech processing pipeline for the diarization and transcription of large audio files.
 
 ## Installation
 
