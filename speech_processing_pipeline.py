@@ -197,7 +197,8 @@ def nemo_inference(asr_model, audio, sr, time_stride, padd, segment_item_list, l
                         "word": word_info["word"],
                         "conf": round(word_confidence_list[i].item(),3)
                     }
-                    word_timestamp_list.append(word_timestamp)
+                    if not word_timestamp["start"] >= word_timestamp["end"]: # Bypass the bug with some words
+                        word_timestamp_list.append(word_timestamp)
                 
                 segment_item["words"] = word_timestamp_list
                 segment_item["language"] = lang
@@ -273,30 +274,114 @@ def nemo_asr(inputs, model_path, segment_item_list, lang, device):
     torch.cuda.empty_cache()
     
     segment_item_list = [segment_item for segment_item in segment_item_list if len(segment_item["words"])>0]
-
+    
     return segment_item_list
 
-# Work in progess
-def segments_for_subtitles(segment_item_list, max_chars: int=40, max_dur: float=5.0, min_dur: float=1.0):
+def divide_segments(segment_item_list, max_chars: int=50, max_dur: float=6.5):
     """
-    Segment or merge sentences for creating better subtitulation files like .vtt or .srt
-    - segment_item_list: list of dicts with 'words' key
-    - max_chars: max characters allowed per sentence
-    - max_dur: max duration per sentence
-    - min_dur: min duration per sentence
+    - segment_item_list: list of dicts --> [{'start', 'end', 'speaker', 'language', 'words': [{'start', 'end', 'word', 'conf'}]}]
+    - max_chars: maximum number of characters allowed (including spaces)
+    - max_dur: maximum segment duration in seconds allowed
+    Returns list of dicts: [{'idx','start', 'end', 'speaker', 'language', 'words': [{'start', 'end', 'word', 'conf'}]}]
     """
-    for i, segment_item in enumerate(segment_item_list):
+    new_segment_item_list = []
+    for idx, segment_item in enumerate(segment_item_list):
+        
         seg_start = segment_item["start"]
         seg_end = segment_item["end"]
-        seg_dur = round(seg_end-seg_start,3)
         words = segment_item["words"]
-        for j, word in enumerate(words):
-            pass 
+        
+        new_words = [words[0]]
+        new_seg_start = seg_start
+        new_seg_end = words[0]["end"]
+        new_seg_chars = len(words[0]["word"]) + 1
+        
+        if len(words)>1:
+            for w in words[1:]:
+                w_start = w["start"]
+                w_end = w["end"]
+                w_chars = len(w["word"])
+
+                p_new_seg_dur = round(w_end - new_seg_start, 3)
+                p_new_seg_chars = new_seg_chars + w_chars
+
+                # Check if the new duration and num of chars of the subsegment is less than trhesholds
+                if p_new_seg_dur <= max_dur and p_new_seg_chars <= max_chars:
+                    new_words.append(w)
+                    new_seg_chars += w_chars + 1 # word's chars + space
+                    new_seg_end = w_end
+
+                # If not, append the subsegment as a new entry and clear restart the words list and counters
+                else:
+                    new_segment_item = {
+                        "idx": idx,
+                        "start": new_seg_start,
+                        "end": new_seg_end,
+                        "speaker": segment_item["speaker"],
+                        "language": segment_item["language"],
+                        "words": new_words
+                    }
+                    new_segment_item_list.append(new_segment_item)
+                    
+                    new_words = [w]
+                    new_seg_start = w_start
+                    new_seg_end = w_end
+                    new_seg_chars = w_chars + 1
+
+            # Append the remaining subsegment
+            new_segment_item = {
+                "idx": idx,
+                "start": new_seg_start,
+                "end": seg_end,
+                "speaker": segment_item["speaker"],
+                "language": segment_item["language"],
+                "words": new_words
+            }
+            new_segment_item_list.append(new_segment_item)
+            
+    return new_segment_item_list
+
+def add_padding(segment_item_list, padd_dur: float=0.5):
+    """
+    Adds padding time before and after segments, always checking they don't make overlaps.
+    - segment_item_list: list of dicts --> [{'start', 'end', 'speaker', 'language', 'words': [{'start', 'end', 'word', 'conf'}]}]
+    - padd_dur: duration in seconds of the padding added before and after segments
+    Returns list of dicts: [{'idx','start', 'end', 'speaker', 'language', 'words': [{'start', 'end', 'word', 'conf'}]}]
+    """
+    for i, segment_item in enumerate(segment_item_list):
+        start = segment_item["start"]
+        end = segment_item["end"]
+        
+        # Add time before the segment without overlaping the previous segment
+        padd = padd_dur
+        if i > 0:
+            prev_end = segment_item_list[i-1]["end"]
+            while padd > 0:
+                if start-padd > prev_end:
+                    start -= padd
+                    break
+                padd -= 0.05             
+        
+        # Add time after the segment without overlaping the next segment
+        padd = padd_dur
+        if i < len(segment_item_list)-1:
+            next_start = segment_item_list[i+1]["start"]
+            while padd > 0:
+                if end+padd < next_start:
+                    end += padd
+                    break
+                padd -= 0.05
+        
+        # Update the times
+        segment_item["start"] = round(start, 3)
+        segment_item["end"] = round(end, 3)
+    
+    return segment_item_list        
     
 def marianmt_cp(segment_item_list, model_path, device):
     """
     Perform C&P of segments using transformers pipeline with MarianMT model.
-    - segment_item_list: list of dicts with 'words' key
+    - segment_item_list: list of dicts --> [{'start', 'end', 'speaker', 'language', 'words': [{'start', 'end', 'word', 'conf'}]}]
     - model_path: path to MarianMt translation model checkpoint
     - device: 'cuda' or 'cpu'
     Returns two lists:
@@ -321,7 +406,7 @@ def marianmt_cp(segment_item_list, model_path, device):
         del translator
         torch.cuda.empty_cache()
     else:
-        cp_segment_list = segment_list
+        cp_segment_list = []
     
     return cp_segment_list, segment_list   
 
@@ -361,11 +446,13 @@ def to_json(segment_list, cp_segment_list, segment_item_list, out_filepath):
         for i, segment_item in enumerate(segment_item_list):
             start = segment_item["start"]
             end = segment_item["end"]
+            pred_text = segment_list[i]
+            cp_pred_text = cp_segment_list[i] if len(cp_pred_text)>0 else ""
             item = {
                 "audio_filepath": "",
                 "text": "",
-                "pred_text": segment_list[i],
-                "cp_pred_text": cp_segment_list[i],
+                "pred_text": pred_text,
+                "cp_pred_text": cp_pred_text,
                 "duration": round(end-start,3),
                 "start": start,
                 "end": end,
@@ -450,15 +537,25 @@ def main(args):
                             segment_item_list=segment_item_list,
                             lang=lang, device=device)
     
-    # Perform C&P using MarianMT
-    cp_segment_list, segment_list = marianmt_cp(segment_item_list=segment_item_list,
-                                                model_path=cp_model, device=device)
-    
-    # Write outputs
+    # -------- Write outputs --------
     os.makedirs(out_path, exist_ok=True)
     
     to_rttm(segment_item_list, f"{out_path}/{audio_name}.rttm")
     to_xml(segment_item_list, f"{out_path}/{audio_name}.xml")
+    
+    # Divide segments and add some extra time, for subtitle-oriented output files
+    max_chars = 50
+    max_dur = 6.5
+    padd_dur = 0.3
+    segment_item_list = divide_segments(segment_item_list=segment_item_list,
+                                        max_chars=max_chars, max_dur=max_dur)
+    segment_item_list = add_padding(segment_item_list=segment_item_list,
+                                    padd_dur=padd_dur)
+    
+    # Perform C&P using MarianMT
+    cp_segment_list, segment_list = marianmt_cp(segment_item_list=segment_item_list,
+                                                model_path=cp_model, device=device)
+    
     to_json(segment_list, cp_segment_list, segment_item_list, f"{out_path}/{audio_name}.json")
     
     to_txt(segment_list, f"{out_path}/{audio_name}.txt")

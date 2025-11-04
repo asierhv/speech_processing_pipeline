@@ -10,7 +10,7 @@ python speech_processing_pipeline.py \
     --seg_option="diar" \
     --stt_model="/mnt/aholab/asierhv/ASR_eu_test_files/results/models/finalmodels/stt_eu_conformer_transducer_large_v2.nemo" \
     --cp_model="" \
-    --device="cpu"
+    --device="cuda"
 
 echo
 
