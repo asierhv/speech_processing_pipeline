@@ -8,6 +8,7 @@ import json
 import numpy as np
 import nemo.collections.asr.models as nemo_models
 import xml.etree.ElementTree as ET
+from collections import Counter
 from omegaconf import open_dict
 from xml.dom import minidom
 from tqdm import tqdm
@@ -384,9 +385,8 @@ def marianmt_cp(segment_item_list, model_path, device):
     - segment_item_list: list of dicts --> [{'start', 'end', 'speaker', 'language', 'words': [{'start', 'end', 'word', 'conf'}]}]
     - model_path: path to MarianMt translation model checkpoint
     - device: 'cuda' or 'cpu'
-    Returns two lists:
-    - cp_segment_list: list of translated texts
-    - segment_list: list of original texts
+    Returns an updated segment_item_list:
+    - segment_item_list: list of dicts --> [{'start', 'end', 'speaker', 'language', 'words': [{'start', 'end', 'word', 'conf'}], 'pred_text', 'cp_pred_text'}]
     """
     if "cuda" in device:
         device_id = 0
@@ -408,13 +408,36 @@ def marianmt_cp(segment_item_list, model_path, device):
     else:
         cp_segment_list = []
     
-    return cp_segment_list, segment_list   
+    for i, segment_item in enumerate(segment_item_list):
+        segment_item["pred_text"] = segment_list[i]
+        segment_item["cp_pred_text"] = cp_segment_list[i] if len(cp_segment_list)>0 else ""
+
+    return segment_item_list
+
+def map_speaker_color(segment_item_list, colors):
+    """
+    Counts how often a speaker appears and maps a color from the list to it. If the list of colors is smaller than speakers, the last color will be used for the rest.
+    - segment_item_list: list of dicts --> [{'start', 'end', 'speaker', 'language', 'words': [{'start', 'end', 'word', 'conf'}], 'pred_text', 'cp_pred_text'}]
+    - colors: list of str with colors in Hex format ["#FFFFFF","#FFFFFF","#FFFFFF"]
+    Returns the updated segment_item_list with 'color' key:
+    - segment_item_list: list of dicts --> [{'start', 'end', 'speaker', 'language', 'words': [{'start', 'end', 'word', 'conf'}], 'pred_text', 'cp_pred_text', 'color'}]
+    """
+    speakers = Counter(segment_item["speaker"] for segment_item in segment_item_list).most_common()
+    speaker_colors = {
+        speaker: colors[i] if i < len(colors)-1 else colors[-1]
+        for i, (speaker, n) in enumerate(speakers)
+    }
+    for segment_item in segment_item_list:
+        segment_item['color'] = speaker_colors[segment_item["speaker"]]
+    
+    return segment_item_list
 
 """
 Add support for language detection in each segment and multiple use of stt models
 """
 
 def to_rttm(segment_item_list, out_filepath):
+    out_filepath = out_filepath + ".rttm"
     _, name = os.path.split(out_filepath)
     with open(out_filepath, "w", encoding="utf-8") as rttm_file:
         for segment_item in segment_item_list:
@@ -422,9 +445,10 @@ def to_rttm(segment_item_list, out_filepath):
             end = segment_item["end"]
             duration = round(end-start,3)
             rttm_file.write(f"SPEAKER {name.replace('.rttm','')} 1 {start:.3f} {duration:.3f} <NA> <NA> {segment_item['speaker']} <NA> <NA>\n")
-    print("End Writing RTTM:", out_filepath)
+    print(f"End Writing RTTM:\n- {out_filepath}")
 
 def to_xml(segment_item_list, out_filepath):
+    out_filepath = out_filepath + ".xml"
     root = ET.Element("root")
     for segment_item in segment_item_list:
         segment = ET.SubElement(root, "segment", speaker=segment_item['speaker'], language=segment_item['language'], start="{:.3f}".format(segment_item['start']), end="{:.3f}".format(segment_item['end']))
@@ -436,61 +460,95 @@ def to_xml(segment_item_list, out_filepath):
     pretty_xml = reparsed.toprettyxml(indent="    ")
     with open(out_filepath, 'w', encoding='utf-8') as xml_file:
         xml_file.write(pretty_xml)
-    print("End Writing XML:", out_filepath)
+    print(f"End Writing XML:\n- {out_filepath}")
     
 def to_trs():
     pass
 
-def to_json(segment_list, cp_segment_list, segment_item_list, out_filepath):
+def to_json(segment_item_list, out_filepath):
+    out_filepath = out_filepath + ".json"
     with open(out_filepath, 'w', encoding='utf-8') as json_file:
         for i, segment_item in enumerate(segment_item_list):
             start = segment_item["start"]
             end = segment_item["end"]
-            pred_text = segment_list[i]
-            cp_pred_text = cp_segment_list[i] if len(cp_pred_text)>0 else ""
             item = {
                 "audio_filepath": "",
+                "idx": segment_item["idx"],
                 "text": "",
-                "pred_text": pred_text,
-                "cp_pred_text": cp_pred_text,
+                "pred_text": segment_item["pred_text"],
+                "cp_pred_text": segment_item["cp_pred_text"],
                 "duration": round(end-start,3),
                 "start": start,
                 "end": end,
                 "speaker": segment_item['speaker'],
+                "color": segment_item['color'],
                 "language": segment_item['language'],
                 "words": segment_item['words']
             }
             json_file.write(json.dumps(item, ensure_ascii=False) + "\n")
-    print("End Writing JSON:", out_filepath)  
+    print(f"End Writing JSON:\n- {out_filepath}")  
 
-def to_txt(segment_list, out_filepath):
-    with open(out_filepath,"w",encoding="utf-8") as txt_file:
-        for segment in segment_list:
-            txt_file.write(segment.strip()+"\n")
-    print("End Writing TXT:", out_filepath)
+def to_txt(segment_item_list, out_filepath):
+    cp_write = False
+    with open(out_filepath+".txt","w",encoding="utf-8") as txt_file:
+        for segment_item in segment_item_list:
+            txt_file.write(segment_item['pred_text']+"\n")
+            if segment_item['cp_pred_text'] != "" and not cp_write:
+                cp_write = True
+    print(f"End Writing TXT:\n- {out_filepath+'.txt'}")
+    if cp_write:
+        with open(out_filepath+"_cp.txt","w",encoding="utf-8") as txt_file:
+            for segment_item in segment_item_list:
+                txt_file.write(segment_item['cp_pred_text']+"\n")
+        print(f"End Writing C&P_TXT:\n- {out_filepath+'_cp.txt'}")
     
-def to_vtt(segment_list, segment_item_list, out_filepath):
-    with open(out_filepath,"w",encoding="utf-8") as vtt_file:
+def to_vtt(segment_item_list, out_filepath):
+    cp_write = False
+    with open(out_filepath+".vtt","w",encoding="utf-8") as vtt_file:
         vtt_file.write("WEBVTT\n\n")
         for i, segment_item in enumerate(segment_item_list):
             vtt_file.write(str(i+1)+"\n")
             start_time=f"{(int(segment_item['start'])//3600):02}:{((int(segment_item['start'])%3600)//60):02}:{(int(segment_item['start'])%60):02}.{(int(((segment_item['start'])-int(segment_item['start']))*1000)):03}"
             end_time=f"{(int(segment_item['end'])//3600):02}:{((int(segment_item['end'])%3600)//60):02}:{(int(segment_item['end'])%60):02}.{(int(((segment_item['end'])-int(segment_item['end']))*1000)):03}"
             vtt_file.write(f"{start_time} --> {end_time} line:16 position:50% align:center\n")
-            text = segment_list[i]
-            vtt_file.write(f"<c.white.bg_black>{text.strip()}</c>\n\n")
-    print("End Writing VTT:", out_filepath)
+            vtt_file.write(f"<c.white.bg_black>{segment_item['pred_text']}</c>\n\n")
+            if segment_item['cp_pred_text'] != "" and not cp_write:
+                cp_write = True
+    print(f"End Writing VTT:\n- {out_filepath+'.vtt'}")
+    if cp_write:
+        with open(out_filepath+"_cp.vtt","w",encoding="utf-8") as vtt_file:
+            vtt_file.write("WEBVTT\n\n")
+            for i, segment_item in enumerate(segment_item_list):
+                vtt_file.write(str(i+1)+"\n")
+                start_time=f"{(int(segment_item['start'])//3600):02}:{((int(segment_item['start'])%3600)//60):02}:{(int(segment_item['start'])%60):02}.{(int(((segment_item['start'])-int(segment_item['start']))*1000)):03}"
+                end_time=f"{(int(segment_item['end'])//3600):02}:{((int(segment_item['end'])%3600)//60):02}:{(int(segment_item['end'])%60):02}.{(int(((segment_item['end'])-int(segment_item['end']))*1000)):03}"
+                vtt_file.write(f"{start_time} --> {end_time} line:16 position:50% align:center\n")
+                vtt_file.write(f"<c.white.bg_black>{segment_item['cp_pred_text']}</c>\n\n")
+        print(f"End Writing C&P_VTT:\n- {out_filepath+'_cp.vtt'}")
 
-def to_srt(segment_list, segment_item_list, out_filepath):
-    with open(out_filepath,"w",encoding="utf-8") as srt_file:
+def to_srt(segment_item_list, out_filepath):
+    cp_write = False
+    with open(out_filepath+".srt","w",encoding="utf-8") as srt_file:
         for i, segment_item in enumerate(segment_item_list):
             srt_file.write(str(i+1)+"\n")
             start_time=f"{(int(segment_item['start'])//3600):02}:{((int(segment_item['start'])%3600)//60):02}:{(int(segment_item['start'])%60):02},{(int(((segment_item['start'])-int(segment_item['start']))*1000)):03}"
             end_time=f"{(int(segment_item['end'])//3600):02}:{((int(segment_item['end'])%3600)//60):02}:{(int(segment_item['end'])%60):02},{(int(((segment_item['end'])-int(segment_item['end']))*1000)):03}"
             srt_file.write(f"{start_time} --> {end_time}\n")
-            text = segment_list[i]
-            srt_file.write(f"<font  color=\"white\" back=\"black\" line=\"16\" position=\"50%\" align=\"center\">{text.strip()}</font>\n\n")
-    print("End Writing SRT:", out_filepath)
+            srt_file.write(f"<font  color=\"{segment_item['color']}\" back=\"black\" line=\"16\" position=\"50%\" align=\"center\">{segment_item['pred_text']}</font>\n\n")
+            if segment_item['cp_pred_text'] != "" and not cp_write:
+                cp_write = True
+    print(f"End Writing SRT:\n- {out_filepath+'.srt'}")
+    if cp_write:
+        with open(out_filepath+".srt","w",encoding="utf-8") as srt_file:
+            for i, segment_item in enumerate(segment_item_list):
+                srt_file.write(str(i+1)+"\n")
+                start_time=f"{(int(segment_item['start'])//3600):02}:{((int(segment_item['start'])%3600)//60):02}:{(int(segment_item['start'])%60):02},{(int(((segment_item['start'])-int(segment_item['start']))*1000)):03}"
+                end_time=f"{(int(segment_item['end'])//3600):02}:{((int(segment_item['end'])%3600)//60):02}:{(int(segment_item['end'])%60):02},{(int(((segment_item['end'])-int(segment_item['end']))*1000)):03}"
+                srt_file.write(f"{start_time} --> {end_time}\n")
+                srt_file.write(f"<font  color=\"{segment_item['color']}\" back=\"black\" line=\"16\" position=\"50%\" align=\"center\">{segment_item['cp_pred_text']}</font>\n\n")
+                if segment_item['cp_pred_text'] != "" and not cp_write:
+                    cp_write = True
+        print(f"End Writing C&P_SRT:\n- {out_filepath+'_cp.srt'}")
 
 
 ########################################################################################
@@ -539,9 +597,10 @@ def main(args):
     
     # -------- Write outputs --------
     os.makedirs(out_path, exist_ok=True)
+    out_filepath = f"{out_path}/{audio_name}"
     
-    to_rttm(segment_item_list, f"{out_path}/{audio_name}.rttm")
-    to_xml(segment_item_list, f"{out_path}/{audio_name}.xml")
+    to_rttm(segment_item_list=segment_item_list, out_filepath=out_filepath)
+    to_xml(segment_item_list=segment_item_list, out_filepath=out_filepath)
     
     # Divide segments and add some extra time, for subtitle-oriented output files
     max_chars = 50
@@ -553,19 +612,22 @@ def main(args):
                                     padd_dur=padd_dur)
     
     # Perform C&P using MarianMT
-    cp_segment_list, segment_list = marianmt_cp(segment_item_list=segment_item_list,
-                                                model_path=cp_model, device=device)
-    
-    to_json(segment_list, cp_segment_list, segment_item_list, f"{out_path}/{audio_name}.json")
-    
-    to_txt(segment_list, f"{out_path}/{audio_name}.txt")
-    to_vtt(segment_list, segment_item_list, f"{out_path}/{audio_name}.vtt")
-    to_srt(segment_list, segment_item_list, f"{out_path}/{audio_name}.srt")
-    
-    if not cp_model=="":
-        to_txt(cp_segment_list, f"{out_path}/{audio_name}_cp.txt")
-        to_vtt(cp_segment_list, segment_item_list, f"{out_path}/{audio_name}_cp.vtt")
-        to_srt(cp_segment_list, segment_item_list, f"{out_path}/{audio_name}_cp.srt")
+    segment_item_list = marianmt_cp(segment_item_list=segment_item_list,
+                                    model_path=cp_model, device=device)
+
+    # Map speakers to colors
+    colors = [
+        "#FFFFFF","#A9FCFF","#FFF68F","#9FFF96",
+        "#FFC48D","#FFB7F9","#FF9F9F","#B89AFF",
+        "#40C9FF","#FFFB2B","#A9FF30","#FFA237",
+        "#D755FF","#FF4949","#44FFC7","#9B9B9B"
+    ]
+    segment_item_list = map_speaker_color(segment_item_list=segment_item_list, colors=colors)
+
+    to_json(segment_item_list=segment_item_list, out_filepath=out_filepath)
+    to_txt(segment_item_list=segment_item_list, out_filepath=out_filepath)
+    to_vtt(segment_item_list=segment_item_list, out_filepath=out_filepath)
+    to_srt(segment_item_list=segment_item_list, out_filepath=out_filepath)
 
 if __name__=="__main__":
     parser = argparse.ArgumentParser(add_help=False)
