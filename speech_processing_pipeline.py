@@ -511,7 +511,7 @@ def to_vtt(segment_item_list, out_filepath):
             start_time=f"{(int(segment_item['start'])//3600):02}:{((int(segment_item['start'])%3600)//60):02}:{(int(segment_item['start'])%60):02}.{(int(((segment_item['start'])-int(segment_item['start']))*1000)):03}"
             end_time=f"{(int(segment_item['end'])//3600):02}:{((int(segment_item['end'])%3600)//60):02}:{(int(segment_item['end'])%60):02}.{(int(((segment_item['end'])-int(segment_item['end']))*1000)):03}"
             vtt_file.write(f"{start_time} --> {end_time} line:16 position:50% align:center\n")
-            vtt_file.write(f"<c.white.bg_black>{segment_item['pred_text']}</c>\n\n")
+            vtt_file.write(f"<c.{segment_item['color']}.bg_black>{segment_item['pred_text']}</c>\n\n")
             if segment_item['cp_pred_text'] != "" and not cp_write:
                 cp_write = True
     print(f"End Writing VTT:\n- {out_filepath+'.vtt'}")
@@ -523,7 +523,7 @@ def to_vtt(segment_item_list, out_filepath):
                 start_time=f"{(int(segment_item['start'])//3600):02}:{((int(segment_item['start'])%3600)//60):02}:{(int(segment_item['start'])%60):02}.{(int(((segment_item['start'])-int(segment_item['start']))*1000)):03}"
                 end_time=f"{(int(segment_item['end'])//3600):02}:{((int(segment_item['end'])%3600)//60):02}:{(int(segment_item['end'])%60):02}.{(int(((segment_item['end'])-int(segment_item['end']))*1000)):03}"
                 vtt_file.write(f"{start_time} --> {end_time} line:16 position:50% align:center\n")
-                vtt_file.write(f"<c.white.bg_black>{segment_item['cp_pred_text']}</c>\n\n")
+                vtt_file.write(f"<c.{segment_item['color']}.bg_black>{segment_item['cp_pred_text']}</c>\n\n")
         print(f"End Writing C&P_VTT:\n- {out_filepath+'_cp.vtt'}")
 
 def to_srt(segment_item_list, out_filepath):
@@ -603,8 +603,8 @@ def main(args):
     to_xml(segment_item_list=segment_item_list, out_filepath=out_filepath)
     
     # Divide segments and add some extra time, for subtitle-oriented output files
-    max_chars = 50
-    max_dur = 6.5
+    max_chars = 100
+    max_dur = 12
     padd_dur = 0.3
     segment_item_list = divide_segments(segment_item_list=segment_item_list,
                                         max_chars=max_chars, max_dur=max_dur)
@@ -617,10 +617,10 @@ def main(args):
 
     # Map speakers to colors
     colors = [
-        "#FFFFFF","#A9FCFF","#FFF68F","#9FFF96",
-        "#FFC48D","#FFB7F9","#FF9F9F","#B89AFF",
-        "#40C9FF","#FFFB2B","#A9FF30","#FFA237",
-        "#D755FF","#FF4949","#44FFC7","#9B9B9B"
+        "white","cyan","yellow","lime",
+        "pink","blue","magenta","orange",
+        "green","purple","gold","red",
+        "olive","maroon","brown","silver"
     ]
     segment_item_list = map_speaker_color(segment_item_list=segment_item_list, colors=colors)
 
