@@ -618,8 +618,8 @@ def main(args):
     # Map speakers to colors
     colors = [
         "white","cyan","yellow","lime",
-        "pink","blue","orange","magenta",
-        "green","gold","purple","red",
+        "pink","blue","magenta","orange",
+        "green","purple","gold","red",
         "olive","maroon","brown","silver"
     ]
     segment_item_list = map_speaker_color(segment_item_list=segment_item_list, colors=colors)
