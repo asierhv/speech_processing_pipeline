@@ -3,15 +3,18 @@ import torch
 import torchaudio
 import yaml
 import argparse
-import uuid
 import json
-import numpy as np
-import nemo.collections.asr.models as nemo_models
 import xml.etree.ElementTree as ET
 from collections import Counter
 from omegaconf import open_dict
 from xml.dom import minidom
 from tqdm import tqdm
+import shutil
+
+# Nvidia NeMo
+import nemo.collections.asr.models as nemo_models
+
+# Pyannote-Audio
 from pyannote.audio import Model
 from pyannote.audio.pipelines import VoiceActivityDetection
 from pyannote.core.utils.helper import get_class_by_name
@@ -159,75 +162,80 @@ def nemo_inference(asr_model, audio, sr, time_stride, padd, segment_item_list, l
         for i, segment_item in enumerate(tqdm(segment_item_list)):
             # Extract segment
             seg_start = segment_item["start"]
-            seg_end = segment_item["end"]            
+            seg_end = segment_item["end"]       
+            seg_duration = round(seg_end-seg_start,3)
             start = int(round(seg_start * sr))
             end = int(round(seg_end * sr))
             audio_seg = audio[start:end]
             
             seg_tensor = torch.tensor(audio_seg, dtype=torch.float32, device=device).unsqueeze(0)
+            if seg_duration >= 0.05:
+                try:
+                    # Preprocess to features
+                    features, features_len = asr_model.preprocessor(
+                        input_signal = seg_tensor,
+                        length = torch.tensor([seg_tensor.shape[1]], device=device)
+                    )
 
-            try:
-                # Preprocess to features
-                features, features_len = asr_model.preprocessor(
-                    input_signal = seg_tensor,
-                    length = torch.tensor([seg_tensor.shape[1]], device=device)
-                )
+                    # Encoder forward
+                    encoded, encoded_len = asr_model.encoder(
+                        audio_signal = features, 
+                        length = features_len
+                    )
 
-                # Encoder forward
-                encoded, encoded_len = asr_model.encoder(
-                    audio_signal = features, 
-                    length = features_len
-                )
-
-                # RNNT decoding
-                hypothesis = asr_model.decoding.rnnt_decoder_predictions_tensor(
-                    encoded, 
-                    encoded_len, 
-                    return_hypotheses = True
-                )
-                hypothesis = hypothesis[0]
-                
-                # Extract words and timestamps
-                word_info_list = hypothesis.timestamp["word"]
-                word_confidence_list = hypothesis.word_confidence
-                word_timestamp_list = []
-                for i, word_info in enumerate(word_info_list):
-                    word_timestamp = {
-                        "start": round(float(word_info["start_offset"]) * time_stride + seg_start, 3),
-                        "end": round(float(word_info["end_offset"]) * time_stride + seg_start, 3),
-                        "word": word_info["word"],
-                        "conf": round(word_confidence_list[i].item(),3)
-                    }
-                    if not word_timestamp["start"] >= word_timestamp["end"]: # Bypass the bug with some words
-                        word_timestamp_list.append(word_timestamp)
-                
-                segment_item["words"] = word_timestamp_list
-                segment_item["language"] = lang
-                
-            except RuntimeError as e:
-                if "CUDA out of memory" in str(e):
-                    print(f"\nWARNING: CUDA OOM during STT inference on segment {i}.\nDividing segment in half using a {padd}s padding and retrying.\n")
-                    mid_time = (seg_start + seg_end) / 2
+                    # RNNT decoding
+                    hypothesis = asr_model.decoding.rnnt_decoder_predictions_tensor(
+                        encoded, 
+                        encoded_len, 
+                        return_hypotheses = True
+                    )
+                    hypothesis = hypothesis[0]
                     
-                    # Create two new segments with padding
-                    subsegment_item_list = [
-                        {"start": seg_start, "end": round(mid_time + padd, 3), "speaker": segment_item["speaker"]},
-                        {"start": round(mid_time - padd, 3), "end": seg_end, "speaker": segment_item["speaker"]},
-                    ]
+                    # Extract words and timestamps
+                    word_info_list = hypothesis.timestamp["word"]
+                    word_confidence_list = hypothesis.word_confidence
+                    word_timestamp_list = []
+                    for i, word_info in enumerate(word_info_list):
+                        word_timestamp = {
+                            "start": round(float(word_info["start_offset"]) * time_stride + seg_start, 3),
+                            "end": round(float(word_info["end_offset"]) * time_stride + seg_start, 3),
+                            "word": word_info["word"],
+                            "conf": round(word_confidence_list[i].item(),3)
+                        }
+                        if not word_timestamp["start"] >= word_timestamp["end"]: # Bypass the bug with some words
+                            word_timestamp_list.append(word_timestamp)
                     
-                    # Recursive call to process the two new segments
-                    subsegment_item_list = nemo_inference(asr_model=asr_model, audio=audio, sr=sr,
-                                                          time_stride=time_stride, padd=padd,
-                                                          subsegment_item_list=segment_item_list,
-                                                          lang=lang, device=device)
+                    segment_item["words"] = word_timestamp_list
+                    segment_item["language"] = lang
                     
-                    # Merge sub segments in one original segment
-                    segment_item = merge_subsegments(subsegment_item_list)
-                    
-                else:
-                    print(f"\nWARNING: {e}\nSkipping segment {i}.\n")
-                    segment_item["language"] = ""
-                    segment_item["words"] = []
+                except RuntimeError as e:
+                    if "CUDA out of memory" in str(e):
+                        print(f"\nWARNING: CUDA OOM during STT inference on segment {i}.\nDividing segment in half using a {padd}s padding and retrying.\n")
+                        mid_time = (seg_start + seg_end) / 2
+                        
+                        # Create two new segments with padding
+                        subsegment_item_list = [
+                            {"start": seg_start, "end": round(mid_time + padd, 3), "speaker": segment_item["speaker"]},
+                            {"start": round(mid_time - padd, 3), "end": seg_end, "speaker": segment_item["speaker"]},
+                        ]
+                        
+                        # Recursive call to process the two new segments
+                        subsegment_item_list = nemo_inference(asr_model=asr_model, audio=audio, sr=sr,
+                                                            time_stride=time_stride, padd=padd,
+                                                            subsegment_item_list=segment_item_list,
+                                                            lang=lang, device=device)
+                        
+                        # Merge sub segments in one original segment
+                        segment_item = merge_subsegments(subsegment_item_list)
+                        
+                    else:
+                        print(f"\nWARNING: {e}\nSkipping segment {i}.\n")
+                        segment_item["language"] = ""
+                        segment_item["words"] = []
+            else:
+                print(f"\nWARNING: Segment < 0.05s \nSkipping segment {i}.\n")
+                segment_item["language"] = ""
+                segment_item["words"] = []
 
             new_segment_item_list.append(segment_item)
     
@@ -399,7 +407,6 @@ def marianmt_cp(segment_item_list, model_path, device):
         segment_list.append(text.strip())
     
     if not model_path=="":
-        # Esto esta fallando, revisar por que:
         translator = pipeline(task="translation", model=model_path, tokenizer=model_path, device=device_id)
         result_list = translator(segment_list)
         cp_segment_list = [result["translation_text"] for result in result_list]
@@ -539,7 +546,7 @@ def to_srt(segment_item_list, out_filepath):
                 cp_write = True
     print(f"End Writing SRT:\n- {out_filepath+'.srt'}")
     if cp_write:
-        with open(out_filepath+".srt","w",encoding="utf-8") as srt_file:
+        with open(out_filepath+"_cp.srt","w",encoding="utf-8") as srt_file:
             for i, segment_item in enumerate(segment_item_list):
                 srt_file.write(str(i+1)+"\n")
                 start_time=f"{(int(segment_item['start'])//3600):02}:{((int(segment_item['start'])%3600)//60):02}:{(int(segment_item['start'])%60):02},{(int(((segment_item['start'])-int(segment_item['start']))*1000)):03}"
@@ -550,11 +557,99 @@ def to_srt(segment_item_list, out_filepath):
                     cp_write = True
         print(f"End Writing C&P_SRT:\n- {out_filepath+'_cp.srt'}")
 
+########################################################################################
+######################################### RUNs #########################################
+########################################################################################
+# Functions to run all or single layers of the pipeline.
+
+def run_diar():
+    pass
+
+def run_stt():
+    pass
+
+def run_cp():
+    pass
+
+def run_all(audio_file, lang, seg_model, config_yml, seg_option, stt_model, cp_model, device, result_path):
+    audio_name, _ = os.path.splitext(os.path.basename(audio_file))
+    out_path = f"{result_path}/{audio_name}"
+    target_sr = 16000 # All nemo models work with 16kHz audio
+
+    # Load audio and resample if needed
+    waveform, sample_rate = torchaudio.load(audio_file)
+    if waveform.shape[0] > 1:
+        waveform = torch.mean(waveform, dim=0, keepdim=True)
+    if sample_rate != target_sr:
+        waveform = torchaudio.functional.resample(waveform, sample_rate, target_sr)
+        sample_rate = target_sr
+        
+    inputs = {'waveform': waveform, 'sample_rate': sample_rate}
+
+    # Perform Segmentation 'diar' or 'vad' using Pyannote
+    segment_item_list = pyannote_seg(inputs=inputs, model_path=seg_model,
+                                     option=seg_option, config_yml=config_yml,
+                                     device=device)
+    
+    # Perform ASR using NeMo
+    segment_item_list = nemo_asr(inputs=inputs, model_path=stt_model,
+                                 segment_item_list=segment_item_list,
+                                 lang=lang, device=device)
+    
+    # -------- Write outputs --------
+    os.makedirs(out_path, exist_ok=True)
+    out_filepath = f"{out_path}/{audio_name}"
+    
+    to_rttm(segment_item_list=segment_item_list, out_filepath=out_filepath)
+    to_xml(segment_item_list=segment_item_list, out_filepath=out_filepath)
+    
+    # Divide segments and add some extra time, for subtitle-oriented output files
+    max_chars = 100
+    max_dur = 12
+    padd_dur = 0.3
+    segment_item_list = divide_segments(segment_item_list=segment_item_list,
+                                        max_chars=max_chars, max_dur=max_dur)
+    segment_item_list = add_padding(segment_item_list=segment_item_list,
+                                    padd_dur=padd_dur)
+    
+    # Perform C&P using MarianMT
+    segment_item_list = marianmt_cp(segment_item_list=segment_item_list,
+                                    model_path=cp_model, device=device)
+
+    # Map speakers to colors
+    colors = [
+        "white","cyan","yellow","lime",
+        "pink","blue","magenta","orange",
+        "green","purple","gold","red",
+        "olive","maroon","brown","silver"
+    ]
+    segment_item_list = map_speaker_color(segment_item_list=segment_item_list, colors=colors)
+
+    to_json(segment_item_list=segment_item_list, out_filepath=out_filepath)
+    to_txt(segment_item_list=segment_item_list, out_filepath=out_filepath)
+    to_vtt(segment_item_list=segment_item_list, out_filepath=out_filepath)
+    to_srt(segment_item_list=segment_item_list, out_filepath=out_filepath)
+
+    # Create .zip file and remove directory
+    zip_file = f"{result_path}/result.zip"
+    shutil.make_archive(zip_file[:-4], "zip", out_path)
+    shutil.rmtree(out_path)
+
+    # Prepare the sample_text for the web
+    max_samples = 3
+    samples = len(segment_item_list) if len(segment_item_list) < max_samples else max_samples
+
+    sample_text = ""
+    for segment_item in segment_item_list[:samples]:
+        sample_text += segment_item["pred_text"] + " "
+    sample_text = sample_text[:-1]+"..."
+
+    return sample_text, zip_file
 
 ########################################################################################
 ######################################### MAIN #########################################
 ########################################################################################
-   
+
 def main(args):
     audio_file = args.audio_file
     audio_name, _ = os.path.splitext(os.path.basename(audio_file))
@@ -628,6 +723,25 @@ def main(args):
     to_txt(segment_item_list=segment_item_list, out_filepath=out_filepath)
     to_vtt(segment_item_list=segment_item_list, out_filepath=out_filepath)
     to_srt(segment_item_list=segment_item_list, out_filepath=out_filepath)
+
+    # For testing
+    # Create .zip file and remove directory
+    zip_file = f"{args.out_path}/result.zip"
+    shutil.make_archive(zip_file[:-4], "zip", out_path)
+    shutil.rmtree(out_path)
+
+    # Prepare the sample_text for the web
+    max_samples = 3
+    samples = len(segment_item_list) if len(segment_item_list) < max_samples else max_samples
+
+    sample_text = ""
+    for segment_item in segment_item_list[:samples]:
+        sample_text += segment_item["pred_text"] + " "
+    sample_text = sample_text[:-1]+"..."
+    print("---------------------------")
+    print("\nSample_text:", sample_text)
+    print("\nZip_File:", zip_file)
+
 
 if __name__=="__main__":
     parser = argparse.ArgumentParser(add_help=False)
