@@ -3,13 +3,13 @@
 start_time=$(date +%s)
 
 python speech_processing_pipeline.py \
-    --audio_file="/mnt/corpus/Common_Voice_v18.0/eu/wavs/common_voice_eu_39359564.wav" \
+    --audio_file="audio.wav" \
     --out_path="./results" \
-    --seg_model="/mnt/aholab/asierhv/vad_for_asr/seg_CONF.ckpt" \
-    --seg_config_yml="seg_config.yaml" \
+    --seg_model="seg_CONF.ckpt" \
+    --seg_config_yml="config.yaml" \
     --seg_option="diar" \
-    --stt_model="/mnt/aholab/asierhv/ASR_eu_test_files/results/models/finalmodels/stt_eu_conformer_transducer_large_v2.nemo" \
-    --cp_model="" \
+    --stt_model="stt_eu_conformer_transducer_large.nemo" \
+    --cp_model="eu_norm-eu" \
     --device="cuda"
 
 echo
