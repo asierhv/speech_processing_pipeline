@@ -3,7 +3,9 @@
 start_time=$(date +%s)
 
 python speech_processing_pipeline.py \
+    --run_mode="all" \
     --audio_file="audio.wav" \
+    --input_text="" \
     --out_path="./results" \
     --seg_model="seg_CONF.ckpt" \
     --seg_config_yml="config.yaml" \

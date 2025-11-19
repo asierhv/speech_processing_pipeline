@@ -4,23 +4,17 @@ import torchaudio
 import yaml
 import argparse
 import json
+import time
+import shutil
+import numpy as np
 import xml.etree.ElementTree as ET
 from collections import Counter
-from omegaconf import open_dict
 from xml.dom import minidom
 from tqdm import tqdm
-import shutil
-
-# Nvidia NeMo
-import nemo.collections.asr.models as nemo_models
-
-# Pyannote-Audio
-from pyannote.audio import Model
-from pyannote.audio.pipelines import VoiceActivityDetection
-from pyannote.core.utils.helper import get_class_by_name
-from transformers import pipeline
 
 def pyannote_seg(inputs, model_path, option, config_yml, device):
+    from pyannote.audio import Model, Pipeline
+    from pyannote.audio.pipelines import VoiceActivityDetection
     """
     Perform segmentation (VAD or Diarization) using pyannote.
     - inputs: {'waveform': torch.Tensor (1,T), 'sample_rate': int}
@@ -30,6 +24,7 @@ def pyannote_seg(inputs, model_path, option, config_yml, device):
     - device: 'cuda' or 'cpu'
     Returns list of dicts: [{'start', 'end', 'speaker'}]
     """    
+    
     # Load configuration
     with open(config_yml, "r") as fp:
         config = yaml.load(fp, Loader=yaml.SafeLoader)
@@ -39,16 +34,14 @@ def pyannote_seg(inputs, model_path, option, config_yml, device):
     
     if option == "diar":
         print("Option mode: Speaker Diarization\n")
-        Klass = get_class_by_name(config["pipeline"]["name"], default_module_name="pyannote.pipeline.blocks")
-        params = config["pipeline"].get("params", {})
-        pyannote_pipeline = Klass(**params)
-        pyannote_pipeline.instantiate(config["params"])
+        pyannote_pipeline = Pipeline.from_pretrained(checkpoint=config)
         
         # Perform segmentation
         pyannote_pipeline.to(torch.device(device))
         result = pyannote_pipeline(inputs)  
         result_tracks = result.exclusive_speaker_diarization.itertracks(yield_label=True)
-        
+        # result_tracks = result.itertracks(yield_label=True)
+
     elif option == "vad":
         print("Option mode: Voice Activity Detection\n")
         model_path = Model.from_pretrained(model_path)
@@ -82,6 +75,7 @@ def merge_subsegments(subsegment_item_list):
     - sub_segment_item_list: list of dicts with 'start', 'end', 'speaker', 'words'
     Returns a dict: {'start', 'end', 'speaker', 'words': [{'start', 'end', 'word', 'conf'}]}
     """
+    
     # Define the padd window
     padd_start = subsegment_item_list[1]["start"]
     padd_end = subsegment_item_list[0]["end"]
@@ -242,6 +236,8 @@ def nemo_inference(asr_model, audio, sr, time_stride, padd, segment_item_list, l
     return new_segment_item_list
 
 def nemo_asr(inputs, model_path, segment_item_list, lang, device):
+    import nemo.collections.asr.models as nemo_models
+    from omegaconf import open_dict
     """
     Perform ASR using nemo.
     - inputs: {'waveform': torch.Tensor (1,T), 'sample_rate': int}
@@ -250,7 +246,8 @@ def nemo_asr(inputs, model_path, segment_item_list, lang, device):
     - lang: 'es', 'eu' or 'bi'
     - device: 'cuda' or 'cpu'
     Returns list of dicts: [{'start', 'end', 'speaker', 'language', 'words': [{'start', 'end', 'word', 'conf'}]}]
-    """
+    """    
+    
     # Load nemo ASR model
     asr_model = nemo_models.ASRModel.restore_from(model_path)
     decoding_cfg = asr_model.cfg.decoding
@@ -293,6 +290,7 @@ def divide_segments(segment_item_list, max_chars: int=50, max_dur: float=6.5):
     - max_dur: maximum segment duration in seconds allowed
     Returns list of dicts: [{'idx','start', 'end', 'speaker', 'language', 'words': [{'start', 'end', 'word', 'conf'}]}]
     """
+    
     new_segment_item_list = []
     for idx, segment_item in enumerate(segment_item_list):
         
@@ -357,6 +355,7 @@ def add_padding(segment_item_list, padd_dur: float=0.5):
     - padd_dur: duration in seconds of the padding added before and after segments
     Returns list of dicts: [{'idx','start', 'end', 'speaker', 'language', 'words': [{'start', 'end', 'word', 'conf'}]}]
     """
+    
     for i, segment_item in enumerate(segment_item_list):
         start = segment_item["start"]
         end = segment_item["end"]
@@ -388,6 +387,7 @@ def add_padding(segment_item_list, padd_dur: float=0.5):
     return segment_item_list        
     
 def marianmt_cp(segment_item_list, model_path, device):
+    from transformers import pipeline
     """
     Perform C&P of segments using transformers pipeline with MarianMT model.
     - segment_item_list: list of dicts --> [{'start', 'end', 'speaker', 'language', 'words': [{'start', 'end', 'word', 'conf'}]}]
@@ -395,7 +395,8 @@ def marianmt_cp(segment_item_list, model_path, device):
     - device: 'cuda' or 'cpu'
     Returns an updated segment_item_list:
     - segment_item_list: list of dicts --> [{'start', 'end', 'speaker', 'language', 'words': [{'start', 'end', 'word', 'conf'}], 'pred_text', 'cp_pred_text'}]
-    """
+    """   
+     
     if "cuda" in device:
         device_id = 0
     else:
@@ -429,6 +430,7 @@ def map_speaker_color(segment_item_list, colors):
     Returns the updated segment_item_list with 'color' key:
     - segment_item_list: list of dicts --> [{'start', 'end', 'speaker', 'language', 'words': [{'start', 'end', 'word', 'conf'}], 'pred_text', 'cp_pred_text', 'color'}]
     """
+    
     speakers = Counter(segment_item["speaker"] for segment_item in segment_item_list).most_common()
     speaker_colors = {
         speaker: colors[i] if i < len(colors)-1 else colors[-1]
@@ -442,6 +444,81 @@ def map_speaker_color(segment_item_list, colors):
 """
 Add support for language detection in each segment and multiple use of stt models
 """
+
+def plot_diarization_sample(inputs, segment_item_list, out_filepath, start_time: float=0.0, end_time: float=10.0, title=None):
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    """
+    Plot diarization speaker bars overlaid on top of an audio waveform sample and saves the figure in a 'png'.
+    - inputs: {'waveform': torch.Tensor (1,T), 'sample_rate': int}
+    - segment_item_list: list of dicts --> [{'start', 'end', 'speaker'}]
+    - out_filepath: name of the output 'png'
+    - start_time: start time of the sample
+    - end_time: end time of the sample
+    - title: title of the figure
+    """
+    
+    # Load waveform
+    audio = inputs["waveform"].squeeze(0).numpy()
+    sr = inputs["sample_rate"]
+    duration = len(audio) / sr
+    if end_time is None or end_time > duration:
+        end_time = duration
+
+    start = int(start_time * sr)
+    end = int(end_time * sr)
+    audio_sample = audio[start:end]
+    t_samples = np.linspace(start_time, end_time, len(audio_sample))
+
+    # Create plot
+    fig, ax = plt.subplots(figsize=(12, 4))
+
+    # Plot waveform in light gray
+    ax.plot(t_samples, audio_sample, color="gray", alpha=0.35, linewidth=0.8)
+
+    # Prepare speakers
+    speakers = sorted(set(segment_item["speaker"] for segment_item in segment_item_list))
+    y_pos = {spk: i for i, spk in enumerate(speakers)}
+
+    cmap = plt.get_cmap("tab20b")
+    speaker_to_color = {speaker: cmap(i % cmap.N) for i, speaker in enumerate(speakers)}
+    bar_height = 0.05
+
+    # Plot speaker segments
+    for segment_item in segment_item_list:
+        speaker = segment_item["speaker"]
+        seg_start = segment_item["start"]
+        seg_end = segment_item["end"]
+        if seg_end < start_time or seg_start > end_time:
+            continue  # skip outside window
+        xi = max(seg_start, start_time)
+        width = min(seg_end, end_time) - xi
+
+        # Vertical position: offset bars for multiple speakers
+        offset = y_pos[speaker] * bar_height * 2
+        y0 = min(audio_sample) + offset
+
+        # Color
+        color = speaker_to_color[speaker]
+
+        rect = patches.Rectangle(
+            (xi, y0), width, bar_height, linewidth=0, alpha=0.7, facecolor=color
+        )
+        ax.add_patch(rect)
+
+    # Axis styling
+    ax.set_xlim(start_time, end_time)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Amplitude / Speakers")
+    ax.set_title(title or "Diarization Overlay on Waveform")
+    ax.grid(axis="x", linestyle="--", linewidth=0.5, alpha=0.5)
+    handles = [patches.Patch(color=speaker_to_color[spk], label=str(spk)) for spk in speakers]
+    ax.legend(handles=handles, loc="upper right", bbox_to_anchor=(1, 1))
+    plt.tight_layout()
+
+    # Save PNG
+    fig.savefig(out_filepath + '.png', dpi=300)
+    plt.close(fig)
 
 def to_rttm(segment_item_list, out_filepath):
     out_filepath = out_filepath + ".rttm"
@@ -562,14 +639,62 @@ def to_srt(segment_item_list, out_filepath):
 ########################################################################################
 # Functions to run all or single layers of the pipeline.
 
-def run_diar():
-    pass
+def run_diar(audio_file, seg_model, config_yml, result_path, device):
+    audio_name, _ = os.path.splitext(os.path.basename(audio_file))
+    out_path = f"{result_path}/{audio_name}"
+    target_sr = 16000 # All nemo models work with 16kHz audio
+
+    # Load audio and resample if needed
+    waveform, sample_rate = torchaudio.load(audio_file)
+    if waveform.shape[0] > 1:
+        waveform = torch.mean(waveform, dim=0, keepdim=True)
+    if sample_rate != target_sr:
+        waveform = torchaudio.functional.resample(waveform, sample_rate, target_sr)
+        sample_rate = target_sr
+        
+    inputs = {'waveform': waveform, 'sample_rate': sample_rate}
+
+    # Perform Segmentation 'diar' using Pyannote
+    segment_item_list = pyannote_seg(inputs=inputs, model_path=seg_model,
+                                     option='diar', config_yml=config_yml,
+                                     device=device)
+    
+    # -------- Write outputs --------
+    os.makedirs(out_path, exist_ok=True)
+    out_filepath = f"{out_path}/{audio_name}"
+
+    to_rttm(segment_item_list=segment_item_list, out_filepath=out_filepath)
+
+    plot_diarization_sample(inputs=inputs, segment_item_list=segment_item_list,
+                            out_filepath=out_filepath)
+    
+    # Create .zip file and remove directory
+    timestamp = int(time.time())
+    zip_file = f"{result_path}/result_{timestamp}.zip"
+    shutil.make_archive(zip_file[:-4], "zip", out_path)
+    # shutil.rmtree(out_path)    
+
+    return zip_file, out_filepath+".png"
 
 def run_stt():
     pass
 
-def run_cp():
-    pass
+def run_cp(text, cp_model, device):
+    sentences = text.split("\n")
+    segment_item_list = []
+    for sentence in sentences:
+        words = sentence.split(" ")
+        segment_item = {
+            "words": [{"word": word} for word in words]
+        }
+        segment_item_list.append(segment_item)
+        
+    segment_item_list = marianmt_cp(segment_item_list=segment_item_list,
+                                    model_path=cp_model, device=device)
+    
+    cp_text = "\n".join([segment_item['cp_pred_text'] for segment_item in segment_item_list])
+    
+    return cp_text.strip()
 
 def run_all(audio_file, lang, seg_model, config_yml, seg_option, stt_model, cp_model, device, result_path):
     audio_name, _ = os.path.splitext(os.path.basename(audio_file))
@@ -631,7 +756,8 @@ def run_all(audio_file, lang, seg_model, config_yml, seg_option, stt_model, cp_m
     to_srt(segment_item_list=segment_item_list, out_filepath=out_filepath)
 
     # Create .zip file and remove directory
-    zip_file = f"{result_path}/result.zip"
+    timestamp = int(time.time())
+    zip_file = f"{result_path}/result_{timestamp}.zip"
     shutil.make_archive(zip_file[:-4], "zip", out_path)
     shutil.rmtree(out_path)
 
@@ -651,32 +777,17 @@ def run_all(audio_file, lang, seg_model, config_yml, seg_option, stt_model, cp_m
 ########################################################################################
 
 def main(args):
+    run_mode = args.run_mode
     audio_file = args.audio_file
-    audio_name, _ = os.path.splitext(os.path.basename(audio_file))
+    text = args.input_text
+    result_path = args.out_path
     seg_model = args.seg_model
     config_yml = args.seg_config_yml
     seg_option = args.seg_option
     stt_model = args.stt_model
     cp_model = args.cp_model
-    out_path = f"{args.out_path}/{audio_name}"
     device = args.device
-    target_sr = 16000 # All nemo models work with 16kHz audio
 
-    # Load audio and resample if needed
-    waveform, sample_rate = torchaudio.load(audio_file)
-    if waveform.shape[0] > 1:
-        waveform = torch.mean(waveform, dim=0, keepdim=True)
-    if sample_rate != target_sr:
-        waveform = torchaudio.functional.resample(waveform, sample_rate, target_sr)
-        sample_rate = target_sr
-        
-    inputs = {'waveform': waveform, 'sample_rate': sample_rate}
-
-    # Perform Segmentation 'diar' or 'vad' using Pyannote
-    segment_item_list = pyannote_seg(inputs=inputs, model_path=seg_model,
-                                     option=seg_option, config_yml=config_yml,
-                                     device=device)
-    
     # Assuming model name contains language code, in the future need to improve this
     if "eu" in os.path.basename(stt_model):
         lang="eu"
@@ -684,68 +795,34 @@ def main(args):
         lang="es"
     else:
         lang="bi"
-    
-    # Perform ASR using NeMo
-    segment_item_list = nemo_asr(inputs=inputs, model_path=stt_model,
-                            segment_item_list=segment_item_list,
-                            lang=lang, device=device)
-    
-    # -------- Write outputs --------
-    os.makedirs(out_path, exist_ok=True)
-    out_filepath = f"{out_path}/{audio_name}"
-    
-    to_rttm(segment_item_list=segment_item_list, out_filepath=out_filepath)
-    to_xml(segment_item_list=segment_item_list, out_filepath=out_filepath)
-    
-    # Divide segments and add some extra time, for subtitle-oriented output files
-    max_chars = 100
-    max_dur = 12
-    padd_dur = 0.3
-    segment_item_list = divide_segments(segment_item_list=segment_item_list,
-                                        max_chars=max_chars, max_dur=max_dur)
-    segment_item_list = add_padding(segment_item_list=segment_item_list,
-                                    padd_dur=padd_dur)
-    
-    # Perform C&P using MarianMT
-    segment_item_list = marianmt_cp(segment_item_list=segment_item_list,
-                                    model_path=cp_model, device=device)
 
-    # Map speakers to colors
-    colors = [
-        "white","cyan","yellow","lime",
-        "pink","blue","magenta","orange",
-        "green","purple","gold","red",
-        "olive","maroon","brown","silver"
-    ]
-    segment_item_list = map_speaker_color(segment_item_list=segment_item_list, colors=colors)
+    # Run dependeing on the mode
+    if run_mode == "all":
+        sample_text, zip_file = run_all(audio_file=audio_file, lang=lang,
+                                        seg_model=seg_model, config_yml=config_yml,
+                                        seg_option=seg_option, stt_model=stt_model,
+                                        cp_model=cp_model, device=device,
+                                        result_path=result_path)
+        
+        print(json.dumps({"sample_text": sample_text, "zip_file": zip_file}))
 
-    to_json(segment_item_list=segment_item_list, out_filepath=out_filepath)
-    to_txt(segment_item_list=segment_item_list, out_filepath=out_filepath)
-    to_vtt(segment_item_list=segment_item_list, out_filepath=out_filepath)
-    to_srt(segment_item_list=segment_item_list, out_filepath=out_filepath)
-
-    # For testing
-    # Create .zip file and remove directory
-    zip_file = f"{args.out_path}/result.zip"
-    shutil.make_archive(zip_file[:-4], "zip", out_path)
-    shutil.rmtree(out_path)
-
-    # Prepare the sample_text for the web
-    max_samples = 3
-    samples = len(segment_item_list) if len(segment_item_list) < max_samples else max_samples
-
-    sample_text = ""
-    for segment_item in segment_item_list[:samples]:
-        sample_text += segment_item["pred_text"] + " "
-    sample_text = sample_text[:-1]+"..."
-    print("---------------------------")
-    print("\nSample_text:", sample_text)
-    print("\nZip_File:", zip_file)
-
+    elif run_mode == "diar":
+        rttm_file, png_file = run_diar(audio_file=audio_file, seg_model=seg_model,
+                                       config_yml=config_yml, result_path=result_path,
+                                       device=device)
+        
+        print(json.dumps({"rttm_file": rttm_file, "png_file": png_file}))
+        
+    elif run_mode == "cp":
+        cp_text = run_cp(text=text, cp_model=cp_model, device=device)
+        
+        print(json.dumps({"cp_text": cp_text}))
 
 if __name__=="__main__":
     parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--run_mode", help="(str): mode of the pipeline\n - 'diar': only run speaker diarization. Outputs: '.png', '.rttm' \n - 'all': runs all the pipeline. Outputs: '.xml', '.rttm', '.json', '.txt', '.srt', '.vtt'\n if selected with C&P: '_cp.txt', '_cp.srt', '_cp.vtt'", required=True, type=str)
     parser.add_argument("--audio_file", help="(str): path to audio file", required=True, type=str)
+    parser.add_argument("--input_text", help="(str): text for capitalization & punctuation", default="", type=str)
     parser.add_argument("--out_path", help="(str): path of the destination folder", default="./results", type=str)
     parser.add_argument("--seg_model", help="(str): path to segmentation model (Pyannote)", default="seg_CONF.ckpt", type=str)
     parser.add_argument("--seg_config_yml", help="(str): path configuration .yaml file for segmentation model", default="config_diarization-3.1.yaml", type=str)
